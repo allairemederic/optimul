@@ -13,30 +13,38 @@ module bitserial_top #(
     parameter int WEIGHT_BITS = 4,
     parameter int ACC_W = 16,
 
-    // Number of bit pairs processed by one DPU
+    // DPA parallelism
+    parameter int DM = 1,
+    parameter int DN = 1,
     parameter int DK = 32,
+    parameter int NUM_DPU = DM * DN,
+
+    // Number of row and column tiles
+    parameter int M_TILES = M / DM,
+    parameter int N_TILES = N / DN,
 
     // Number of Transformer weight sets
     parameter int NUM_LAYERS = 2,
 
-    // Derived address and counter widths
+    // Address widths
     parameter int ACT_ADDR_W = $clog2(M * K),
     parameter int RESULT_ADDR_W = $clog2(M * N),
-    parameter int M_W = $clog2(M),
+
+    // Widths of full matrix indices
+    parameter int M_W = (M <= 1) ? 1 : $clog2(M),
+    parameter int N_W = (N <= 1) ? 1 : $clog2(N),
 
     // Number of DK-wide groups in the K dimension
     parameter int K_GROUPS = K / DK,
-    parameter int K_GROUP_W = $clog2(K_GROUPS),
+    parameter int K_GROUP_W = (K_GROUPS <= 1) ? 1 : $clog2(K_GROUPS),
 
     // Widths of the bit-plane indices
-    parameter int ACT_PLANE_W = $clog2(ACT_PLANES),
-    parameter int WEIGHT_PLANE_W = $clog2(WEIGHT_BITS),
+    parameter int ACT_PLANE_W = (ACT_PLANES <= 1) ? 1 : $clog2(ACT_PLANES),
+    parameter int WEIGHT_PLANE_W = (WEIGHT_BITS <= 1) ? 1 : $clog2(WEIGHT_BITS),
 
-    // Weight ROM dimensions
-    parameter int WEIGHT_DEPTH =
-        NUM_LAYERS * N * WEIGHT_BITS * K_GROUPS,
-
-    parameter int WEIGHT_ADDR_W = $clog2(WEIGHT_DEPTH),
+    // Each ROM word contains DN groups of DK weight bits
+    parameter int WEIGHT_DEPTH = NUM_LAYERS * N_TILES * WEIGHT_BITS * K_GROUPS,
+    parameter int WEIGHT_ADDR_W = (WEIGHT_DEPTH <= 1) ? 1 : $clog2(WEIGHT_DEPTH),
 
     // Width of one popcount result
     parameter int COUNT_W = $clog2(DK + 1),
@@ -47,16 +55,13 @@ module bitserial_top #(
     input logic clk,
     input logic reset,
 
-    // Starts a new matrix multiplication
     input logic start,
-
-    // Selects the weight set for the current Transformer layer
-    input logic layer_select,
+    input logic layer_select, // Selects the weights of the current Transformer layer
 
     // Activation input interface
-    input  logic                     activation_valid,
-    input  logic [ACT_W-1:0]         activation_data,
-    output logic                     activation_ready,
+    input  logic                 activation_valid,
+    input  logic [ACT_W-1:0]     activation_data,
+    output logic                 activation_ready,
 
     // Result output interface
     output logic                         result_valid,
@@ -69,52 +74,69 @@ module bitserial_top #(
     output logic done
 );
 
+    // Check that the matrix dimensions are compatible with the selected parallelism
+    initial begin
+        if ((M % DM) != 0) begin
+            $fatal(1, "DM must divide M.");
+        end
+
+        if ((N % DN) != 0) begin
+            $fatal(1, "DN must divide N.");
+        end
+
+        if ((K % DK) != 0) begin
+            $fatal(1, "DK must divide K.");
+        end
+    end
+
     // Activation-buffer write controls
     logic activation_write_enable;
     logic [ACT_ADDR_W-1:0] activation_write_address;
 
-    // Indices used to select the current activation bit plane
-    logic [M_W-1:0] row_index;
+    // Position of the current result tile
+    logic [M_W-1:0] row_base;
+    logic [N_W-1:0] column_base;
+
+    // Current K group and bit-plane indices
     logic [K_GROUP_W-1:0] k_group;
     logic [ACT_PLANE_W-1:0] activation_plane;
     logic [WEIGHT_PLANE_W-1:0] weight_plane;
 
-    // Binary activation and weight vectors sent to the DPA
-    logic [DK-1:0] activation_bits;
-    logic [DK-1:0] weight_bits;
+    // DM activation vectors and DN weight vectors
+    logic [DM-1:0][DK-1:0] activation_bits;
+    logic [DN-1:0][DK-1:0] weight_bits;
 
     // Weight-ROM read controls
     logic weight_read_enable;
     logic [WEIGHT_ADDR_W-1:0] weight_read_address;
 
-    // DPA interfaces
-    // The first version contains only one DPU
-    logic [0:0][DK-1:0] dpa_activation_bits;
-    logic [0:0][DK-1:0] dpa_weight_bits;
-    logic [0:0][COUNT_W-1:0] dpa_counts;
+    // One popcount result for each DPA row-column pair
+    logic [DM-1:0][DN-1:0][COUNT_W-1:0] dpa_counts;
 
-    // Accumulator controls and current value
+    // Accumulator-bank controls
     logic accumulator_clear;
     logic accumulator_enable;
-    logic signed [ACC_W-1:0] accumulator_value;
+
+    // One accumulated value for each DPA row-column pair
+    logic signed [DM-1:0][DN-1:0][ACC_W-1:0] accumulator_values;
 
     // Result-buffer controls
     logic result_write_enable;
-    logic [RESULT_ADDR_W-1:0] result_write_address;
-    logic [RESULT_ADDR_W-1:0] result_read_address;
 
-    // Connect the activation and weight vectors to DPU 0
-    assign dpa_activation_bits[0] = activation_bits;
-    assign dpa_weight_bits[0] = weight_bits;
+    logic [M_W-1:0] result_row_base;
+    logic [N_W-1:0] result_column_base;
+
+    logic [RESULT_ADDR_W-1:0] result_read_address;
 
     // The output index is the current result-buffer read address
     assign result_index = result_read_address;
 
-    // Stores the activation matrix and extracts activation bit planes
+    // Stores the activation matrix and extracts DM bit-plane vectors
     activation_buffer #(
         .M(M),
         .K(K),
         .ACT_W(ACT_W),
+        .DM(DM),
         .DK(DK)
     ) activation_buffer_inst (
         .clk(clk),
@@ -123,82 +145,94 @@ module bitserial_top #(
         .write_address(activation_write_address),
         .write_data(activation_data),
 
-        .row_index(row_index),
+        .row_base(row_base),
         .k_group(k_group),
         .bit_plane(activation_plane),
 
         .plane_bits(activation_bits)
     );
 
-    // Stores the weight bit planes for both Transformer layers
+    // Stores the weight bit planes for all Transformer layers
+    // Each read returns DN vectors of DK bits
     weight_rom #(
+        .DN(DN),
         .DK(DK),
         .DEPTH(WEIGHT_DEPTH),
         .INIT_FILE(WEIGHT_FILE)
     ) weight_rom_inst (
         .clk(clk),
-
         .read_enable(weight_read_enable),
         .read_address(weight_read_address),
         .read_data(weight_bits)
     );
 
-    // Computes the AND-popcount operation
-    // This first version uses one DPU
+    // Computes DM x DN parallel AND-popcount operations
     dot_product_array #(
+        .DM(DM),
+        .DN(DN),
         .DK(DK),
-        .NUM_DPU(1)
+        .COUNT_W(COUNT_W)
     ) dpa_inst (
-        .a_bits(dpa_activation_bits),
-        .w_bits(dpa_weight_bits),
+        .activation_bits(activation_bits),
+        .weight_bits(weight_bits),
         .counts(dpa_counts)
     );
 
-    // Applies the bit-plane weight, corrects the sign and accumulates the partial results.
-    weighted_accumulator #(
+    // Applies the bit-plane weights and accumulates the DM x DN partial results
+    accumulator_bank #(
+        .DM(DM),
+        .DN(DN),
         .DK(DK),
         .ACT_PLANES(ACT_PLANES),
         .WEIGHT_BITS(WEIGHT_BITS),
         .ACC_W(ACC_W)
-    ) accumulator_inst (
+    ) accumulator_bank_inst (
         .clk(clk),
         .reset(reset),
 
         .clear(accumulator_clear),
         .enable(accumulator_enable),
 
-        .popcount(dpa_counts[0]),
+        .popcounts(dpa_counts),
         .activation_plane(activation_plane),
         .weight_plane(weight_plane),
 
-        .value(accumulator_value)
+        .values(accumulator_values)
     );
 
-    // Stores the completed M x N output matrix
+    // Stores one complete DM x DN result tile in parallel
     result_buffer #(
         .M(M),
         .N(N),
+        .DM(DM),
+        .DN(DN),
         .DATA_W(ACC_W)
     ) result_buffer_inst (
         .clk(clk),
 
         .write_enable(result_write_enable),
-        .write_address(result_write_address),
-        .write_data(accumulator_value),
+        .write_row_base(result_row_base),
+        .write_column_base(result_column_base),
+        .write_data(accumulator_values),
 
         .read_address(result_read_address),
         .read_data(result_data)
     );
 
-    // Controls all loading, computation and writing operations
+    // Controls loading, tiled computation and result writing
     bismo_controller #(
         .M(M),
         .K(K),
         .N(N),
+
         .ACT_W(ACT_W),
         .ACT_PLANES(ACT_PLANES),
         .WEIGHT_BITS(WEIGHT_BITS),
+
+        .DM(DM),
+        .DN(DN),
         .DK(DK),
+
         .NUM_LAYERS(NUM_LAYERS)
     ) controller_inst (
         .clk(clk),
@@ -216,7 +250,9 @@ module bitserial_top #(
         .activation_write_enable(activation_write_enable),
         .activation_write_address(activation_write_address),
 
-        .row_index(row_index),
+        .row_base(row_base),
+        .column_base(column_base),
+
         .k_group(k_group),
         .activation_plane(activation_plane),
         .weight_plane(weight_plane),
@@ -228,7 +264,8 @@ module bitserial_top #(
         .accumulator_enable(accumulator_enable),
 
         .result_write_enable(result_write_enable),
-        .result_write_address(result_write_address),
+        .result_row_base(result_row_base),
+        .result_column_base(result_column_base),
         .result_read_address(result_read_address),
 
         .busy(busy),

@@ -3,7 +3,8 @@
 module activation_buffer #(
     parameter int M = 4,     // Number of rows in the activation matrix
     parameter int K = 128,   // Number of elements in each row
-    parameter int ACT_W = 4, // Number of elements in each row.
+    parameter int ACT_W = 4, // Number of elements in each row
+    parameter int DM = 1,    // Number of activation rows processed in parallel
     parameter int DK = 32,   // Number of activation bits sent to the DPU in parallel
 
     parameter int ADDR_W = $clog2(M * K),       // Width of the address used to load the activation buffer
@@ -20,17 +21,20 @@ module activation_buffer #(
     input  logic [ACT_W-1:0]        write_data,
 
     // Indices selecting the requested activation bits
-    input  logic [M_W-1:0]          row_index,
+    input  logic [M_W-1:0]          row_base,
     input  logic [K_GROUP_W-1:0]    k_group,
     input  logic [PLANE_W-1:0]      bit_plane,
 
-    // Selected bit plane for DK consecutive activations
-    output logic [DK-1:0]           plane_bits
+    // Selected bit plane for DM rows of DK consecutive activations
+    output logic [DM-1:0][DK-1:0] plane_bits
 );
 
-    logic [ACT_W-1:0] memory [0:M*K-1]; // Activation memory containing M rows of K values
+    // Activation memory containing M rows of K values
+    logic [ACT_W-1:0] memory [0:M*K-1];
 
+    integer dm;
     integer b;
+    integer row;
     integer element_index;
 
     // Store one activation on each valid write
@@ -40,13 +44,23 @@ module activation_buffer #(
         end
     end
 
-    // Extract one bit from each of DK consecutive activations
+    // Extract DK bits from each of DM activation rows
     always_comb begin
         plane_bits = '0;
 
-        for (b = 0; b < DK; b++) begin
-            element_index = row_index * K + k_group * DK + b; // Convert the row, group and position into a flat address
-            plane_bits[b] = memory[element_index][bit_plane]; // Select the requested bit plane
+        // Select each parallel activation row
+        for (dm = 0; dm < DM; dm++) begin
+            row = row_base + dm;
+
+            // Extract DK bits from the selected row and bit plane
+            for (b = 0; b < DK; b++) begin
+                
+                // Convert the row, K group, and bit positio into a flat memory address
+                element_index = row * K + k_group * DK + b;
+
+                // Select the requested bit from the activation
+                plane_bits[dm][b] = memory[element_index][bit_plane];
+            end
         end
     end
 
