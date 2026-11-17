@@ -17,6 +17,9 @@ module bismo_controller #(
     parameter int DN = 1,
     parameter int DK = 32,
 
+    parameter int ACT_LANES = 4,
+    parameter int RESULT_LANES = 8,
+
     // Number of Transformer weight sets
     parameter int NUM_LAYERS = 2,
 
@@ -83,7 +86,7 @@ module bismo_controller #(
     output logic [WEIGHT_ADDR_W-1:0]     weight_read_address,
 
     // Controls the accumulator bank
-    output logic accumulator_clear,
+    output logic accumulator_initialize,
     output logic accumulator_enable,
 
     // Controls writes to the result buffer
@@ -102,10 +105,7 @@ module bismo_controller #(
     typedef enum logic [3:0] {
         IDLE,
         LOAD_ACTIVATIONS,
-        CLEAR_ACCUMULATORS,
-        FETCH_OPERANDS,
-        ACCUMULATE,
-        STORE_RESULTS,
+        COMPUTE,
         WRITE_RESULTS,
         DONE_STATE
     } state_t;
@@ -133,6 +133,15 @@ module bismo_controller #(
     // Temporary weight-ROM address
     integer computed_weight_address;
 
+    // Values for accumulator
+    logic first_contribution;
+    logic last_contribution;
+
+    always_comb begin
+        first_contribution = (k_index == 0) && (i_index == 0) && (j_index == 0);
+        last_contribution = (k_index == K_GROUPS - 1) && (i_index == ACT_PLANES - 1) && (j_index == WEIGHT_BITS - 1);
+    end
+
     // Convert tile indices into matrix row and column indices
     assign row_base = m_tile * DM;
     assign column_base = n_tile * DN;
@@ -153,8 +162,9 @@ module bismo_controller #(
         weight_read_enable = 1'b0;
         weight_read_address = '0;
 
-        accumulator_clear = 1'b0;
+        accumulator_initialize = 1'b0;
         accumulator_enable = 1'b0;
+        result_write_enable = 1'b0;
 
         result_write_enable = 1'b0;
         result_row_base = row_base;
@@ -180,25 +190,19 @@ module bismo_controller #(
                 end
             end
 
-            CLEAR_ACCUMULATORS: begin
-                // Clear all accumulators before computing a new tile
-                accumulator_clear = 1'b1;
-            end
-
-            FETCH_OPERANDS: begin
-                // Request the next group of weight bit planes
+            COMPUTE: begin
                 weight_read_enable = 1'b1;
                 weight_read_address = WEIGHT_ADDR_W'(computed_weight_address);
-            end
 
-            ACCUMULATE: begin
-                // Add all DPA popcounts to their accumulators
                 accumulator_enable = 1'b1;
-            end
+                accumulator_initialize = first_contribution;
 
-            STORE_RESULTS: begin
-                // Store the complete DM-by-DN result tile
-                result_write_enable = 1'b1;
+                // Store the completed tile during its final computation
+                if (last_contribution) begin
+                    result_write_enable = 1'b1;
+                    result_row_base = row_base;
+                    result_column_base = column_base;
+                end
             end
 
             WRITE_RESULTS: begin
@@ -260,96 +264,77 @@ module bismo_controller #(
                 LOAD_ACTIVATIONS: begin
                     // Advance only when one activation is transferred
                     if (activation_valid && activation_ready) begin
-                        if (load_index == ACT_COUNT - 1) begin
+                        if (load_index == ACT_COUNT - ACT_LANES) begin
                             // All M x K activations have been loaded
                             load_index <= '0;
-                            state <= CLEAR_ACCUMULATORS;
+
+                            k_index <= '0;
+                            i_index <= '0;
+                            j_index <= '0;
+
+                            state <= COMPUTE;
                         end
                         else begin
-                            load_index <= load_index + 1'b1;
+                            load_index <= load_index + ACT_LANES;
                         end
                     end
                 end
 
-                CLEAR_ACCUMULATORS: begin
-                    // Start the computation of a new result tile
-                    k_index <= '0;
-                    i_index <= '0;
-                    j_index <= '0;
-
-                    state <= FETCH_OPERANDS;
-                end
-
-                FETCH_OPERANDS: begin
-                    // The synchronous weight ROM returns its data after this rising clock edge
-                    state <= ACCUMULATE;
-                end
-
-                ACCUMULATE: begin
-                    // Move through the K groups first
+                COMPUTE: begin
                     if (k_index == K_GROUPS - 1) begin
                         k_index <= '0;
 
-                        // Move to the next weight bit plane
                         if (j_index == WEIGHT_BITS - 1) begin
                             j_index <= '0;
 
-                            // Move to the next activation bit plane
                             if (i_index == ACT_PLANES - 1) begin
                                 i_index <= '0;
 
-                                // All bit-plane pairs are complete
-                                state <= STORE_RESULTS;
+                                // The current tile is complete and is being written to the result buffer on this edge
+                                if (n_tile == N_TILES - 1) begin
+                                    n_tile <= '0;
+
+                                    if (m_tile == M_TILES - 1) begin
+                                        m_tile <= '0;
+                                        output_index <= '0;
+                                        state <= WRITE_RESULTS;
+                                    end
+                                    else begin
+                                        m_tile <= m_tile + 1'b1;
+                                        state <= COMPUTE;
+                                    end
+                                end
+                                else begin
+                                    n_tile <= n_tile + 1'b1;
+                                    state <= COMPUTE;
+                                end
                             end
                             else begin
                                 i_index <= i_index + 1'b1;
-                                state <= FETCH_OPERANDS;
+                                state <= COMPUTE;
                             end
                         end
                         else begin
                             j_index <= j_index + 1'b1;
-                            state <= FETCH_OPERANDS;
+                            state <= COMPUTE;
                         end
                     end
                     else begin
                         k_index <= k_index + 1'b1;
-                        state <= FETCH_OPERANDS;
-                    end
-                end
-
-                STORE_RESULTS: begin
-                    // Move to the next output-column tile
-                    if (n_tile == N_TILES - 1) begin
-                        n_tile <= '0;
-
-                        // Move to the next activation-row tile
-                        if (m_tile == M_TILES - 1) begin
-                            // The complete M x N matrix is available
-                            m_tile <= '0;
-                            output_index <= '0;
-                            state <= WRITE_RESULTS;
-                        end
-                        else begin
-                            m_tile <= m_tile + 1'b1;
-                            state <= CLEAR_ACCUMULATORS;
-                        end
-                    end
-                    else begin
-                        n_tile <= n_tile + 1'b1;
-                        state <= CLEAR_ACCUMULATORS;
+                        state <= COMPUTE;
                     end
                 end
 
                 WRITE_RESULTS: begin
                     // Advance only when the receiver accepts a result
                     if (result_valid && result_ready) begin
-                        if (output_index == RESULT_COUNT - 1) begin
+                        if (output_index >= RESULT_COUNT - RESULT_LANES) begin
                             // All M x N results have been transmitted
                             output_index <= '0;
                             state <= DONE_STATE;
                         end
                         else begin
-                            output_index <= output_index + 1'b1;
+                            output_index <= output_index + RESULT_LANES;
                         end
                     end
                 end

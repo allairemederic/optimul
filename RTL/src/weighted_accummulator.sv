@@ -1,39 +1,38 @@
 // Applies the bit-plane weight and accumulates the partial result
 
 module weighted_accumulator #(
-    parameter int DK = 32,         // Number of bit pairs processed by the DPU
-    parameter int ACT_PLANES = 3,  // Number of useful activation bit planes
-    parameter int WEIGHT_BITS = 4, // Number of bits used to represent each signed weight
-    parameter int ACC_W = 16,      // Width of the signed accumulator
+    parameter int DK = 32,
+    parameter int ACT_PLANES = 3,
+    parameter int WEIGHT_BITS = 4,
+    parameter int ACC_W = 16,
 
-    parameter int COUNT_W = $clog2(DK + 1),            // Width of the DPU popcount result
-    parameter int ACT_PLANE_W = $clog2(ACT_PLANES),    // Width of the activation bit-plane index
-    parameter int WEIGHT_PLANE_W = $clog2(WEIGHT_BITS) // Width of the weight bit-plane index
+    parameter int COUNT_W = $clog2(DK + 1),
+    parameter int ACT_PLANE_W = (ACT_PLANES > 1) ? $clog2(ACT_PLANES) : 1,
+    parameter int WEIGHT_PLANE_W = (WEIGHT_BITS > 1) ? $clog2(WEIGHT_BITS) : 1
 ) (
     input  logic                              clk,
     input  logic                              reset,
 
-    input  logic                              clear,    // Clears the accumulator before computing a new output
-    input  logic                              enable,   // Adds the current contribution to the accumulator
+    input  logic                              initialize,
+    input  logic                              enable,
 
-    input  logic [COUNT_W-1:0]                popcount,         // Partial binary dot product produced by the DPU
-    input  logic [ACT_PLANE_W-1:0]            activation_plane, // Current activation index
-    input  logic [WEIGHT_PLANE_W-1:0]         weight_plane,     // Current weight index
+    input  logic [COUNT_W-1:0]                popcount,
+    input  logic [ACT_PLANE_W-1:0]            activation_plane, 
+    input  logic [WEIGHT_PLANE_W-1:0]         weight_plane,
 
-    output logic signed [ACC_W-1:0]           value // Current signed accumulated result
+    output logic signed [ACC_W-1:0] value,
+    output logic signed [ACC_W-1:0] next_value
 );
 
     logic signed [ACC_W-1:0] count_extended; // Popcount extended to the accumulator width
     logic signed [ACC_W-1:0] shifted_value;  // Popcount shifted according to the bit-plane positions
     logic signed [ACC_W-1:0] contribution;   // Signed value added to the accumulator
 
-    integer shift_amount; // Total number of positions used for the shift
+    integer shift_amount;
 
-    // Compute the weighted and signed contribution
     always_comb begin
 
-        // Convert the unsigned popcount into a positive signed value
-        count_extended = $signed({1'b0, popcount});
+        count_extended = $signed({1'b0, popcount}); // Convert into a positive signed value
         
         // A pair of bit planes has a weight of 2^(i+j)
         shift_amount = activation_plane + weight_plane;
@@ -46,6 +45,14 @@ module weighted_accumulator #(
         else begin
             contribution = shifted_value;
         end
+
+        // The first contribution replaces the previous tile value
+        if (initialize) begin
+            next_value = contribution;
+        end
+        else begin
+            next_value = value + contribution;
+        end
     end
 
     // Store the accumulated result
@@ -53,11 +60,8 @@ module weighted_accumulator #(
         if (reset) begin
             value <= '0;
         end
-        else if (clear) begin
-            value <= '0;
-        end
         else if (enable) begin
-            value <= value + contribution;
+            value <= next_value;
         end
     end
 

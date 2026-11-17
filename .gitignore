@@ -1,0 +1,10 @@
+# RTL-generated results
+RTL/results/
+RTL/simulations/
+
+# Vivado-generated files
+*.jou
+*.log
+*.str
+*.pb
+.Xil/

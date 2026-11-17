@@ -16,7 +16,7 @@ module accumulator_bank #(
     input logic reset,
 
     // Common control signals for all accumulators
-    input logic clear,
+    input logic initialize,
     input logic enable,
 
     // One popcount value for each DPU
@@ -27,7 +27,8 @@ module accumulator_bank #(
     input logic [WEIGHT_PLANE_W-1:0] weight_plane,
 
     // One accumulated result for each DPU
-    output logic signed [DM-1:0][DN-1:0][ACC_W-1:0] values
+    output logic signed [DM-1:0][DN-1:0][ACC_W-1:0] values,
+    output logic signed [DM-1:0][DN-1:0][ACC_W-1:0] next_values
 );
 
     genvar dm;
@@ -37,6 +38,7 @@ module accumulator_bank #(
     generate
         for (dm = 0; dm < DM; dm++) begin : gen_acc_rows
             for (dn = 0; dn < DN; dn++) begin : gen_acc_columns
+
                 weighted_accumulator #(
                     .DK(DK),
                     .ACT_PLANES(ACT_PLANES),
@@ -45,13 +47,15 @@ module accumulator_bank #(
                 ) accumulator (
                     .clk(clk),
                     .reset(reset),
-                    .clear(clear),
+                    .initialize(initialize),
                     .enable(enable),
                     .popcount(popcounts[dm][dn]),
                     .activation_plane(activation_plane),
                     .weight_plane(weight_plane),
-                    .value(values[dm][dn])
+                    .value(values[dm][dn]),
+                    .next_value(next_values[dm][dn])
                 );
+
             end
         end
     endgenerate

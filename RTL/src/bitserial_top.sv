@@ -13,6 +13,12 @@ module bitserial_top #(
     parameter int WEIGHT_BITS = 4,
     parameter int ACC_W = 16,
 
+    // Input interface parallelism
+    parameter int ACT_LANES = 4,
+
+    // Output interface parallelism
+    parameter int RESULT_LANES = 8,
+
     // DPA parallelism
     parameter int DM = 1,
     parameter int DN = 1,
@@ -59,14 +65,14 @@ module bitserial_top #(
     input logic layer_select, // Selects the weights of the current Transformer layer
 
     // Activation input interface
-    input  logic                 activation_valid,
-    input  logic [ACT_W-1:0]     activation_data,
-    output logic                 activation_ready,
+    input  logic                            activation_valid,
+    input  logic [ACT_LANES-1:0][ACT_W-1:0] activation_data,
+    output logic                            activation_ready,
 
     // Result output interface
     output logic                         result_valid,
     output logic [RESULT_ADDR_W-1:0]     result_index,
-    output logic signed [ACC_W-1:0]      result_data,
+    output logic signed [RESULT_LANES-1:0][ACC_W-1:0]      result_data,
     input  logic                         result_ready,
 
     // Module status
@@ -114,11 +120,12 @@ module bitserial_top #(
     logic [DM-1:0][DN-1:0][COUNT_W-1:0] dpa_counts;
 
     // Accumulator-bank controls
-    logic accumulator_clear;
+    logic accumulator_initialize;
     logic accumulator_enable;
 
     // One accumulated value for each DPA row-column pair
     logic signed [DM-1:0][DN-1:0][ACC_W-1:0] accumulator_values;
+    logic signed [DM-1:0][DN-1:0][ACC_W-1:0] accumulator_next_values;
 
     // Result-buffer controls
     logic result_write_enable;
@@ -136,6 +143,7 @@ module bitserial_top #(
         .M(M),
         .K(K),
         .ACT_W(ACT_W),
+        .ACT_LANES(ACT_LANES),
         .DM(DM),
         .DK(DK)
     ) activation_buffer_inst (
@@ -160,7 +168,6 @@ module bitserial_top #(
         .DEPTH(WEIGHT_DEPTH),
         .INIT_FILE(WEIGHT_FILE)
     ) weight_rom_inst (
-        .clk(clk),
         .read_enable(weight_read_enable),
         .read_address(weight_read_address),
         .read_data(weight_bits)
@@ -190,14 +197,15 @@ module bitserial_top #(
         .clk(clk),
         .reset(reset),
 
-        .clear(accumulator_clear),
+        .initialize(accumulator_initialize),
         .enable(accumulator_enable),
 
         .popcounts(dpa_counts),
         .activation_plane(activation_plane),
         .weight_plane(weight_plane),
 
-        .values(accumulator_values)
+        .values(accumulator_values),
+        .next_values(accumulator_next_values)
     );
 
     // Stores one complete DM x DN result tile in parallel
@@ -206,14 +214,15 @@ module bitserial_top #(
         .N(N),
         .DM(DM),
         .DN(DN),
-        .DATA_W(ACC_W)
+        .DATA_W(ACC_W),
+        .RESULT_LANES(RESULT_LANES)
     ) result_buffer_inst (
         .clk(clk),
 
         .write_enable(result_write_enable),
         .write_row_base(result_row_base),
         .write_column_base(result_column_base),
-        .write_data(accumulator_values),
+        .write_data(accumulator_next_values),
 
         .read_address(result_read_address),
         .read_data(result_data)
@@ -228,6 +237,9 @@ module bitserial_top #(
         .ACT_W(ACT_W),
         .ACT_PLANES(ACT_PLANES),
         .WEIGHT_BITS(WEIGHT_BITS),
+
+        .ACT_LANES(ACT_LANES),
+        .RESULT_LANES(RESULT_LANES),
 
         .DM(DM),
         .DN(DN),
@@ -260,7 +272,7 @@ module bitserial_top #(
         .weight_read_enable(weight_read_enable),
         .weight_read_address(weight_read_address),
 
-        .accumulator_clear(accumulator_clear),
+        .accumulator_initialize(accumulator_initialize),
         .accumulator_enable(accumulator_enable),
 
         .result_write_enable(result_write_enable),

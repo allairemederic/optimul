@@ -1,0 +1,77 @@
+{
+  "c_function_name": "ff1_bitserial_blackbox",
+  "rtl_top_module_name": "ff1_bitserial_blackbox",
+
+  "c_files": [
+    {
+      "c_file": "ff1_bitserial_blackbox.cpp",
+      "cflag": "-I../../src"
+    }
+  ],
+
+  "rtl_files": [
+    "ff1_bitserial_blackbox.sv",
+    "../rtl/bitserial_dpu.sv",
+    "../rtl/dot_product_array.sv",
+    "../rtl/activation_buffer.sv",
+    "../rtl/weight_rom.sv",
+    "../rtl/weighted_accumulator.sv",
+    "../rtl/accumulator_bank.sv",
+    "../rtl/result_buffer.sv",
+    "../rtl/bismo_controller.sv",
+    "../rtl/bitserial_top.sv"
+  ],
+
+  "c_parameters": [
+    {
+      "c_name": "layer",
+      "c_port_direction": "in",
+      "rtl_ports": {
+        "data_read_in": "layer"
+      }
+    },
+    {
+      "c_name": "activation_stream",
+      "c_port_direction": "in",
+      "rtl_ports": {
+        "FIFO_empty_flag": "activation_empty_n",
+        "FIFO_read_enable": "activation_read",
+        "FIFO_data_read_in": "activation_dout"
+      }
+    },
+    {
+      "c_name": "result_stream",
+      "c_port_direction": "out",
+      "rtl_ports": {
+        "FIFO_full_flag": "result_full_n",
+        "FIFO_write_enable": "result_write",
+        "FIFO_data_write_out": "result_din"
+      }
+    }
+  ],
+
+  "rtl_common_signal": {
+    "module_clock": "ap_clk",
+    "module_reset": "ap_rst",
+    "module_clock_enable": "ap_ce",
+
+    "ap_ctrl_chain_protocol_idle": "ap_idle",
+    "ap_ctrl_chain_protocol_start": "ap_start",
+    "ap_ctrl_chain_protocol_ready": "ap_ready",
+    "ap_ctrl_chain_protocol_done": "ap_done",
+    "ap_ctrl_chain_protocol_continue": "ap_continue"
+  },
+
+  "rtl_performance": {
+    "latency": "179",
+    "II": "0"
+  },
+
+  "rtl_resource_usage": {
+    "FF": "4697",
+    "LUT": "9181",
+    "BRAM": "0",
+    "URAM": "0",
+    "DSP": "0"
+  }
+}

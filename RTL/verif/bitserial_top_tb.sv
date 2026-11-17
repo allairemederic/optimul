@@ -3,7 +3,9 @@
 module tb_bitserial_top #(
     parameter int DM = 1,
     parameter int DN = 1,
-    parameter int DK = 32
+    parameter int DK = 32,
+    parameter int ACT_LANES = 4,
+    parameter int RESULT_LANES = 8
 );
 
     // Parameters for parallelization
@@ -16,18 +18,26 @@ module tb_bitserial_top #(
     localparam int ACC_W = 16;
     localparam int NUM_LAYERS = 2;
     localparam int RESULT_COUNT = M * N;
+    localparam int RESULT_WRITE_CYCLES = (RESULT_COUNT + RESULT_LANES - 1) / RESULT_LANES;
     localparam int RESULT_ADDR_W = $clog2(RESULT_COUNT);
     localparam int M_TILES = M / DM;
     localparam int N_TILES = N / DN;
     localparam int K_GROUPS = K / DK;
     localparam int WEIGHT_WORD_W = DN * DK;
 
-    // Expected cycle count for the current controller.
+    localparam int ACT_COUNT = M * K;
+    localparam int ACT_LOAD_CYCLES = (ACT_COUNT + ACT_LANES - 1) / ACT_LANES;
+
+    // Expected cycle count with:
+    // - ACT_LANES activations loaded per cycle
+    // - combinational weight reads
+    // - one COMPUTE cycle per bit-plane contribution
+    // - one result transmitted per cycle
     localparam int EXPECTED_CYCLES =
         2
-        + M * K
-        + M * N
-        + M_TILES * N_TILES * ( 2 + 2 * ACT_PLANES * WEIGHT_BITS * K_GROUPS);
+        + ACT_LOAD_CYCLES
+        + RESULT_WRITE_CYCLES
+        + M_TILES * N_TILES * (ACT_PLANES * WEIGHT_BITS * K_GROUPS);
 
     localparam time CLOCK_PERIOD = 10ns; // 100 MHZ
 
@@ -41,14 +51,14 @@ module tb_bitserial_top #(
     logic done;
 
     // Activation input interface
-    logic                 activation_valid;
-    logic [ACT_W-1:0]     activation_data;
-    logic                 activation_ready;
+    logic                            activation_valid;
+    logic [ACT_LANES-1:0][ACT_W-1:0] activation_data;
+    logic                            activation_ready;
 
     // Result output interface
     logic                             result_valid;
     logic [RESULT_ADDR_W-1:0]         result_index;
-    logic signed [ACC_W-1:0]          result_data;
+    logic signed [RESULT_LANES-1:0][ACC_W-1:0]         result_data;
     logic                             result_ready;
 
     // Reference matrices used by the testbench
@@ -64,6 +74,8 @@ module tb_bitserial_top #(
     integer current_layer;
 
     // Variables used by the result monitor
+    integer result_lane;
+    integer received_index;
     integer received_row;
     integer received_column;
     integer received_value;
@@ -77,6 +89,8 @@ module tb_bitserial_top #(
         .ACT_PLANES(ACT_PLANES),
         .WEIGHT_BITS(WEIGHT_BITS),
         .ACC_W(ACC_W),
+        .ACT_LANES(ACT_LANES),
+        .RESULT_LANES(RESULT_LANES),
         .DM(DM),
         .DN(DN),
         .DK(DK),
@@ -209,8 +223,11 @@ module tb_bitserial_top #(
         end
     endtask
 
-    // Send all M x K activations to the DUT.
+    // Send ACT_LANES activations on each transfer
     task automatic send_activations;
+        integer base_index;
+        integer lane;
+        integer activation_index;
         integer m;
         integer k;
 
@@ -221,24 +238,31 @@ module tb_bitserial_top #(
             // Wait until the controller enters LOAD_ACTIVATIONS
             wait (activation_ready == 1'b1);
 
-            for (m = 0; m < M; m++) begin
-                for (k = 0; k < K; k++) begin
-                    // Drive the next value before the rising edge
-                    @(negedge clk);
+            // Send one group of ACT_LANES activations per cycle.
+            for (base_index = 0; base_index < ACT_COUNT; base_index = base_index + ACT_LANES) begin
+                @(negedge clk);
 
-                    activation_valid = 1'b1;
-                    activation_data = activations[m][k];
+                activation_valid = 1'b1;
+                activation_data = '0;
 
-                    // The activation is accepted on the next edge
-                    @(posedge clk);
+                for (lane = 0; lane < ACT_LANES; lane++) begin
+                    activation_index = base_index + lane;
 
-                    if (!activation_ready) begin
-                        $fatal(1, "Activation interface stopped unexpectedly.");
-                    end
+                    m = activation_index / K;
+                    k = activation_index % K;
+
+                    activation_data[lane] = activations[m][k];
                 end
-            end
 
-            // Stop sending data after the last activation
+                // The complete activation group is accepted here
+                @(posedge clk);
+
+                if (!activation_ready) begin
+                    $fatal(1, "Activation interface stopped unexpectedly.");
+                end
+            end   
+
+            // Stop sending after the final activation group
             @(negedge clk);
 
             activation_valid = 1'b0;
@@ -256,7 +280,7 @@ module tb_bitserial_top #(
 
         begin
             $display("Test for Transformer layer %0d", selected_layer);
-            $display("Configuration: DM=%0d DN=%0d DK=%0d", DM, DN, DK);
+            $display("Configuration: DM=%0d DN=%0d DK=%0d ACT_LANES=%0d", DM, DN, DK, ACT_LANES);
 
             current_layer = selected_layer;
             received_count = 0;
@@ -309,6 +333,8 @@ module tb_bitserial_top #(
             $display("DM:              %0d", DM);
             $display("DN:              %0d", DN);
             $display("DK:              %0d", DK);
+            $display("Activation lanes: %0d", ACT_LANES);
+            $display("Result lanes:     %0d", RESULT_LANES);
             $display("DPUs:            %0d", DM * DN);
             $display("Cycles:          %0d", measured_cycles);
             $display("Latency at 100 MHz: %0.2f us", measured_cycles / 100.0);
@@ -328,36 +354,38 @@ module tb_bitserial_top #(
         end
     endtask
 
-    // Monitor and verify every output result
+    // Monitor and verify each group of output results.
     always @(posedge clk) begin
         if (result_valid && result_ready) begin
-            received_row = result_index / N;
-            received_column = result_index % N;
-            received_value = $signed(result_data);
 
-            received_count = received_count + 1;
+            for (result_lane = 0; result_lane < RESULT_LANES; result_lane++) begin
+                received_index = result_index + result_lane;
 
-            if (received_value !== expected_results[received_row][received_column]) begin
-                run_errors = run_errors + 1;
-                total_errors = total_errors + 1;
+                // This condition also supports a final partial group
+                if (received_index < RESULT_COUNT) begin
+                    received_row = received_index / N;
+                    received_column = received_index % N;
 
-                $display(
-                    "[FAIL] Layer=%0d Y[%0d][%0d]: expected=%0d received=%0d",
-                    current_layer,
-                    received_row,
-                    received_column,
-                    expected_results[received_row] [received_column],
-                    received_value
-                );
-            end
-            else begin
-                $display(
-                    "[PASS] Layer=%0d Y[%0d][%0d] = %0d",
-                    current_layer,
-                    received_row,
-                    received_column,
-                    received_value
-                );
+                    received_value = $signed(result_data[result_lane]);
+                    received_count = received_count + 1;
+
+                    if (received_value !== expected_results[received_row][received_column]) begin
+                        run_errors = run_errors + 1;
+                        total_errors = total_errors + 1;
+
+                        $display(
+                            "[FAIL] Layer=%0d Y[%0d][%0d]: expected=%0d received=%0d",
+                            current_layer,
+                            received_row,
+                            received_column,
+                            expected_results[received_row][received_column],
+                            received_value
+                        );
+                    end
+                    else begin
+                        $display("[PASS] Layer=%0d Y[%0d][%0d] = %0d", current_layer, received_row, received_column, received_value);
+                    end
+                end
             end
         end
     end

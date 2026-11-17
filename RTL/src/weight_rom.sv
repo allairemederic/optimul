@@ -1,20 +1,21 @@
-// Read-only memory containing the prearranged weight bit planes
+// Stores the packed weight bit planes in block RAM
+// Each memory word contains DN vectors of DK bits
+// Vivado splits wide words across multiple physical BRAMs when needed
 
 module weight_rom #(
     parameter int DN = 1,
     parameter int DK = 32,                         
     parameter int DEPTH = 1024,
-    parameter int ADDR_W = $clog2(DEPTH),
-    parameter string INIT_FILE = "weights_ff1.mem"
+    parameter int WORD_W = DN * DK,
+    parameter int ADDR_W = (DEPTH > 1) ? $clog2(DEPTH) : 1,
+    parameter string INIT_FILE = ""
 ) (
-    input  logic                  clk,
     input  logic                  read_enable,
     input  logic [ADDR_W-1:0]     read_address,
     output logic [DN-1:0][DK-1:0] read_data
 );
 
-    // ROM containing DEPTH words of DN x DK bits
-    logic [DN*DK-1:0] memory [0:DEPTH-1];
+    logic [WORD_W-1:0] memory [0:DEPTH-1];
 
     // Load the weight values when the simulation or FPGA starts
     initial begin
@@ -23,11 +24,14 @@ module weight_rom #(
         end
     end
 
-    // Synchronous ROM read
-    // The requested word becomes available after the rising clock edge
-    always_ff @(posedge clk) begin
+    // Combinational weight read
+    // The selected weight plane is available in the same cycle
+    always_comb begin
         if (read_enable) begin
-            read_data <= memory[read_address];
+            read_data = memory[read_address];
+        end
+        else begin
+            read_data = '0;
         end
     end
 
